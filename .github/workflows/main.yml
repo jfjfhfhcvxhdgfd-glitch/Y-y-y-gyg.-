@@ -1,0 +1,80 @@
+name: Optimized Remote Windows Environment
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */5 * * *' # Her 5 saatte bir otomatik yenilenir
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+
+    - name: Clean Up Disk Space (Maximize Free Space)
+      run: |
+        Write-Host "Cleaning up unnecessary files to free up disk space..."
+        # Gereksiz büyük dizinleri temizleyerek yer açıyoruz
+        Remove-Item -Recurse -Force "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild" -ErrorAction SilentlyContinue
+        Remove-Item -Recurse -Force "C:\Android" -ErrorAction SilentlyContinue
+        Remove-Item -Recurse -Force "C:\vcpkg" -ErrorAction SilentlyContinue
+        
+        $freeSpace = [math]::Round((Get-PSDrive C).Free / 1GB, 2)
+        Write-Host "Current Free Space on C: $freeSpace GB"
+
+    - name: Configure Windows Environment & RDP
+      run: |
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+        Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
+        
+        # Ses ve Mikrofon Yönlendirme İzinleri
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "fDisableAudioPlayback" -Value 0
+        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "fDisableAudioCapture" -Value 0
+        
+        # Windows Audio Servisini Başlat
+        Set-Service -Name "Audiosrv" -StartupType Automatic
+        Start-Service -Name "Audiosrv"
+
+    - name: Create Custom Administrator User ('Draghyper')
+      env:
+        RDP_PASS: ${{ secrets.RDP_PASSWORD }}
+      run: |
+        $username = "Draghyper"
+        $password = ConvertTo-SecureString $env:RDP_PASS -AsPlainText -Force
+        New-LocalUser -Name $username -Password $password -FullName "Draghyper Admin" -Description "Remote Gaming & Control User"
+        Add-LocalGroupMember -Group "Administrators" -Member $username
+
+    - name: Connect to Tailscale VPN
+      uses: tailscale/github-action@v2
+      with:
+        authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+        version: latest
+
+    - name: Voice Notification & System Ready Check
+      run: |
+        Add-Type -AssemblyName System.Speech
+        $speak = New-Object System.Speech.Synthesis.SpeechSynthesizer
+        $speak.Speak("Remote Windows environment is ready.")
+
+    - name: Keep-Alive & Auto-Restart Loop (Bypass 6-Hour Limit)
+      run: |
+        Write-Host "Environment is running. Monitoring time..."
+        $duration = 345 # 345 dakika
+        for ($i = 1; $i -le $duration; $i++) {
+            Start-Sleep -Seconds 60
+        }
+        
+        $headers = @{
+            "Authorization" = "token ${{ secrets.GITHUB_TOKEN }}"
+            "Accept" = "application/vnd.github.v3+json"
+        }
+        $body = @{
+            ref = "${{ github.ref_name }}"
+        } | ConvertTo-Json
+
+        Invoke-RestMethod -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/${{ github.workflow }}/dispatches" -Method Post -Headers $headers -Body $body
+        Write-Host "Auto-restart workflow triggered successfully!"
