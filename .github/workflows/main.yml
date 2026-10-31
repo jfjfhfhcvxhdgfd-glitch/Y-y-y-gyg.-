@@ -1,122 +1,91 @@
 name: RDP
-
 on: push
-
-permissions:
-  contents: read
-
 jobs:
-  secure-rdp:
+  rdp:
     runs-on: windows-latest
     timeout-minutes: 360
     steps:
-      - name: 1. Validate Secrets
-        shell: pwsh
-        env:
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-          CLOUD_COOKIE: ${{ secrets.CLOUD_COOKIE }}
-        run: |
-          $hatalar = @()
-          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) { $hatalar += "RDP_PASSWORD eksik." }
-          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) { $hatalar += "TAILSCALE_AUTH_KEY eksik." }
-          elseif ($env:TAILSCALE_AUTH_KEY -notmatch '^tskey-auth-') { $hatalar += "TAILSCALE_AUTH_KEY yanlis format." }
-          if ([string]::IsNullOrWhiteSpace($env:CLOUD_COOKIE)) { $hatalar += "CLOUD_COOKIE eksik." }
-          if ($hatalar.Count -gt 0) { $hatalar | ForEach-Object { Write-Host $_ -ForegroundColor Red }; throw "Secret eksik!" }
-          Write-Host "Secret kontrolleri tamamlandi." -ForegroundColor Green
+    - name: Check Secrets
+      shell: pwsh
+      env:
+        RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        CLOUD_COOKIE: ${{ secrets.CLOUD_COOKIE }}
+      run: |
+        if (-not $env:RDP_PASSWORD) { throw "RDP_PASSWORD eksik" }
+        if (-not $env:TAILSCALE_AUTH_KEY) { throw "TAILSCALE_AUTH_KEY eksik" }
+        if (-not $env:CLOUD_COOKIE) { throw "CLOUD_COOKIE eksik" }
+        Write-Host "Secrets OK"
 
-      - name: 2. Configure RDP and User
-        shell: pwsh
-        env:
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-        run: |
-          $securePassword = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
-          $user = Get-LocalUser -Name "Draghyper" -ErrorAction SilentlyContinue
-          if ($null -eq $user) { New-LocalUser -Name "Draghyper" -Password $securePassword -Description "RDP account" | Out-Null }
-          else { Set-LocalUser -Name "Draghyper" -Password $securePassword }
-          Add-LocalGroupMember -Group "Administrators" -Member "Draghyper" -ErrorAction SilentlyContinue
-          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
-          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name UserAuthentication -Value 1
-          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name SecurityLayer -Value 2
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
-          Set-Service -Name TermService -StartupType Automatic
-          Restart-Service -Name TermService -Force
-          Write-Host "RDP ayarlari tamamlandi."
+    - name: Setup RDP
+      shell: pwsh
+      env:
+        RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+      run: |
+        $pass = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+        $u = Get-LocalUser -Name "Draghyper" -ErrorAction SilentlyContinue
+        if (-not $u) { New-LocalUser "Draghyper" -Password $pass -PasswordNeverExpires:$true | Out-Null }
+        else { Set-LocalUser "Draghyper" -Password $pass }
+        Add-LocalGroupMember "Administrators" "Draghyper" -ErrorAction SilentlyContinue
+        Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' -Name fDenyTSConnections -Value 0 -Force
+        Set-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name UserAuthentication -Value 1 -Force
+        Set-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' -Name fDisableAudioCapture -Value 0 -PropertyType DWord -Force | Out-Null
+        Set-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services' -Name fDisableAudioPlayback -Value 0 -PropertyType DWord -Force | Out-Null
+        Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+        Restart-Service TermService -Force
+        Write-Host "RDP OK"
 
-      - name: 3. Enable Audio and Microphone
-        shell: pwsh
-        run: |
-          $policyPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
-          New-Item -Path $policyPath -Force | Out-Null
-          New-ItemProperty -Path $policyPath -Name fDisableAudioCapture -PropertyType DWord -Value 0 -Force | Out-Null
-          New-ItemProperty -Path $policyPath -Name fDisableAudioPlayback -PropertyType DWord -Value 0 -Force | Out-Null
-          foreach ($svc in @("AudioEndpointBuilder", "Audiosrv")) {
-            $s = Get-Service -Name $svc -ErrorAction SilentlyContinue
-            if ($null -ne $s) { try { Set-Service -Name $svc -StartupType Automatic; Start-Service -Name $svc } catch {} }
-          }
-          Restart-Service -Name TermService -Force
-          Write-Host "Ses ve mikrofon ayarlari yapildi."
+    - name: Clean Disk
+      shell: pwsh
+      run: |
+        Get-ChildItem $env:TEMP, "$env:WINDIR\Temp" -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        Write-Host "Disk cleaned"
 
-      - name: 4. Free Disk Space
-        shell: pwsh
-        run: |
-          $tempPaths = @($env:TEMP, "$env:WINDIR\Temp")
-          foreach ($path in $tempPaths) {
-            if (Test-Path $path) { Get-ChildItem -LiteralPath $path -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue }
-          }
-          Write-Host "Gecici dosyalar temizlendi."
+    - name: Install Tailscale
+      shell: pwsh
+      run: |
+        $msi = "$env:TEMP\ts.msi"
+        Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $msi
+        Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait
+        "TAILSCALE_EXE=$env:ProgramFiles\Tailscale\tailscale.exe" | Out-File $env:GITHUB_ENV -Append
 
-      - name: 5. Install Tailscale
-        shell: pwsh
-        run: |
-          $msi = Join-Path $env:TEMP "tailscale-setup.msi"
-          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $msi
-          Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait
-          "TAILSCALE_EXE=$env:ProgramFiles\Tailscale\tailscale.exe" | Out-File -FilePath $env:GITHUB_ENV -Append
+    - name: Connect Tailscale
+      shell: pwsh
+      env:
+        TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+      run: |
+        & $env:TAILSCALE_EXE up --auth-key="$env:TAILSCALE_AUTH_KEY" --hostname="gh-$env:GITHUB_RUN_ID"
+        Start-Sleep 5
+        $ip = (& $env:TAILSCALE_EXE ip -4 | Select-Object -First 1).Trim()
+        "RDP_IP=$ip" | Out-File $env:GITHUB_ENV -Append
+        Write-Host "IP: $ip"
 
-      - name: 6. Connect Tailscale
-        shell: pwsh
-        env:
-          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-        run: |
-          $hostname = "gh-runner-$env:GITHUB_RUN_ID"
-          & $env:TAILSCALE_EXE up --auth-key="$env:TAILSCALE_AUTH_KEY" --hostname="$hostname"
-          Start-Sleep -Seconds 5
-          $ip = (& $env:TAILSCALE_EXE ip -4 | Select-Object -First 1).Trim()
-          "RDP_IP=$ip" | Out-File -FilePath $env:GITHUB_ENV -Append
-          Write-Host "Tailscale baglandi. IP: $ip"
+    - name: Mount TeraBox
+      shell: pwsh
+      env:
+        CLOUD_COOKIE: ${{ secrets.CLOUD_COOKIE }}
+      run: |
+        curl.exe -sL -o "$env:TEMP\rclone.zip" "https://downloads.rclone.org/rclone-current-windows-amd64.zip"
+        Expand-Archive "$env:TEMP\rclone.zip" "$env:TEMP\rclone" -Force
+        $r = Get-ChildItem "$env:TEMP\rclone" -Filter "rclone-*-windows-amd64" | Select-Object -First 1
+        $exe = "$($r.FullName)\rclone.exe"
+        $env:RCLONE_CONFIG_MYCLOUD_TYPE = "terabox"
+        $env:RCLONE_CONFIG_MYCLOUD_NDUS = $env:CLOUD_COOKIE
+        Start-Process $exe -ArgumentList "mount mycloud: Z: --vfs-cache-mode writes --volname TeraBox" -NoNewWindow -PassThru
+        Start-Sleep 15
+        if (Test-Path "Z:\") {
+          New-Item -ItemType Directory -Force "Z:\Downloads", "Z:\Temp" | Out-Null
+          $dl = "C:\Users\Draghyper\Downloads"
+          if (Test-Path $dl) { Remove-Item $dl -Recurse -Force -ErrorAction SilentlyContinue }
+          cmd /c mklink /J $dl "Z:\Downloads"
+          $t = $env:TEMP
+          if (Test-Path $t) { Remove-Item $t -Recurse -Force -ErrorAction SilentlyContinue }
+          cmd /c mklink /J $t "Z:\Temp"
+          Write-Host "TeraBox Z: OK"
+        } else { Write-Host "TeraBox FAILED" }
 
-      - name: 7. Mount TeraBox as Z: Drive
-        shell: pwsh
-        env:
-          CLOUD_COOKIE: ${{ secrets.CLOUD_COOKIE }}
-        run: |
-          curl.exe -sL -o "$env:TEMP\rclone.zip" "https://downloads.rclone.org/rclone-current-windows-amd64.zip"
-          Expand-Archive -Path "$env:TEMP\rclone.zip" -DestinationPath "$env:TEMP\rclone" -Force
-          $rcloneDir = Get-ChildItem -Path "$env:TEMP\rclone" -Filter "rclone-*-windows-amd64" | Select-Object -First 1
-          $rcloneExe = Join-Path $rcloneDir.FullName "rclone.exe"
-          $env:RCLONE_CONFIG_MYCLOUD_TYPE = "terabox"
-          $env:RCLONE_CONFIG_MYCLOUD_NDUS = $env:CLOUD_COOKIE
-          Start-Process -FilePath $rcloneExe -ArgumentList "mount mycloud: Z: --vfs-cache-mode writes --volname 'TeraBox 1TB'" -NoNewWindow -PassThru
-          Start-Sleep -Seconds 15
-          if (Test-Path "Z:\") {
-            Write-Host "TeraBox Z: surucusune baglandi!" -ForegroundColor Green
-            New-Item -ItemType Directory -Force -Path "Z:\Downloads", "Z:\Temp" | Out-Null
-            $dl = "C:\Users\Draghyper\Downloads"
-            if (Test-Path $dl) { Remove-Item $dl -Recurse -Force -ErrorAction SilentlyContinue }
-            cmd /c mklink /J $dl "Z:\Downloads"
-            $tmp = $env:TEMP
-            if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
-            cmd /c mklink /J $tmp "Z:\Temp"
-            Write-Host "Indirmeler Z: diskine yonlendirildi." -ForegroundColor Green
-          } else {
-            Write-Host "UYARI: Z: surucusu baglanamadi. CLOUD_COOKIE degerini kontrol et." -ForegroundColor Red
-          }
-
-      - name: 8. Maintain Connection
-        shell: pwsh
-        run: |
-          Write-Host "RDP oturumu 6 saate kadar acik tutulacak."
-          Write-Host "Adres: $env:RDP_IP"
-          Write-Host "Kullanici adi: Draghyper"
-          for ($i = 1; $i -le 360; $i++) { Start-Sleep -Seconds 60 }
+    - name: Keep Alive
+      shell: pwsh
+      run: |
+        Write-Host "IP: $env:RDP_IP | User: Draghyper"
+        for ($i = 1; $i -le 360; $i++) { Start-Sleep 60 }
