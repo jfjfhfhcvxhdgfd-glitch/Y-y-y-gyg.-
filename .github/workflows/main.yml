@@ -300,4 +300,4 @@ jobs:
           for ($i = 1; $i -le 360; $i++) {
             Write-Host "Bağlantı aktif. Geçen süre: $i dakika"
             Start-Sleep -Seconds 60
-          }
+           }
