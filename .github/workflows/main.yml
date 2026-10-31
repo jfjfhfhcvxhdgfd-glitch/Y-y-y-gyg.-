@@ -27,15 +27,15 @@ jobs:
               $env:RDP_PASSWORD -notmatch '[a-z]' -or
               $env:RDP_PASSWORD -notmatch '\d' -or
               $env:RDP_PASSWORD -notmatch '[^a-zA-Z0-9]') {
-            throw "RDP_PASSWORD en az 12 karakter; buyuk harf, kucuk harf, rakam ve sembol icermeli."
+            throw "RDP_PASSWORD en az 12 karakter; büyük harf, küçük harf, rakam ve sembol içermeli."
           }
           if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
             throw "TAILSCALE_AUTH_KEY secret eksik."
           }
           if ([string]::IsNullOrWhiteSpace($env:CLOUD_COOKIE)) {
-            throw "CLOUD_COOKIE secret eksik."
+            throw "CLOUD_COOKIE secret eksik. (TeraBox ndus çerezi)"
           }
-          Write-Host "Gerekli secret kontrolleri tamamlandi."
+          Write-Host "Gerekli secret kontrolleri tamamlandı."
 
       - name: Configure Windows RDP
         shell: pwsh
@@ -82,7 +82,7 @@ jobs:
           Set-Service -Name TermService -StartupType Automatic
           Restart-Service -Name TermService -Force
 
-          Write-Host "Windows RDP ayarlari tamamlandi."
+          Write-Host "Windows RDP ayarları tamamlandı."
 
       - name: Enable RDP Audio and Microphone Redirection
         shell: pwsh
@@ -109,21 +109,37 @@ jobs:
                 Set-Service -Name $serviceName -StartupType Automatic `
                   -ErrorAction Stop
                 Start-Service -Name $serviceName -ErrorAction Stop
-                Write-Host "$serviceName baslatildi."
+                Write-Host "$serviceName başlatıldı."
               } catch {
-                Write-Warning "$serviceName baslatilamadi: $($_.Exception.Message)"
+                Write-Warning "$serviceName başlatılamadı: $($_.Exception.Message)"
               }
+            } else {
+              Write-Warning "$serviceName bu Windows kurulumunda bulunamadı."
             }
           }
 
+          Write-Host "Mikrofon/ses yönlendirme ilkeleri:"
+          Get-ItemProperty -Path $policyPath |
+            Select-Object fDisableAudioCapture, fDisableAudioPlayback |
+            Format-List
+
+          Write-Host "Not: Mikrofonun görünmesi, RDP istemcisinin ve oturumun yönlendirmeyi desteklemesine de bağlıdır."
+
           gpupdate /target:computer /force
+          if ($LASTEXITCODE -ne 0) {
+            Write-Warning "gpupdate başarısız oldu; kayıt defteri ilkeleri yine de yazıldı."
+          }
+
           Restart-Service -Name TermService -Force
           Start-Sleep -Seconds 3
-          Write-Host "RDP servisi ses yonlendirme ilkelerinden sonra yeniden baslatildi."
+          Write-Host "RDP servisi ses yönlendirme ilkelerinden sonra yeniden başlatıldı."
 
       - name: Free Temporary Disk Space
         shell: pwsh
         run: |
+          Write-Host "=== Disk space before cleanup ==="
+          Get-PSDrive C
+
           $tempPaths = @(
             $env:TEMP,
             "$env:WINDIR\Temp"
@@ -138,8 +154,9 @@ jobs:
             }
           }
 
-          Write-Host "Disk space after cleanup:"
+          Write-Host "=== Disk space after cleanup ==="
           Get-PSDrive C
+          Write-Host "Geçici dosyalar temizlendi."
 
       - name: Install Tailscale
         shell: pwsh
@@ -155,12 +172,12 @@ jobs:
             -Wait -PassThru
 
           if ($process.ExitCode -notin @(0, 3010)) {
-            throw "Tailscale kurulumu basarisiz. Kod: $($process.ExitCode)"
+            throw "Tailscale kurulumu başarısız. Kod: $($process.ExitCode)"
           }
 
           $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
           if (-not (Test-Path $tailscale)) {
-            throw "Tailscale programi bulunamadi."
+            throw "Tailscale programı bulunamadı."
           }
 
           "TAILSCALE_EXE=$tailscale" |
@@ -179,74 +196,77 @@ jobs:
             --hostname="$hostname"
 
           if ($LASTEXITCODE -ne 0) {
-            throw "Tailscale girisi basarisiz. Auth key ve cihaz politikasini kontrol et."
+            throw "Tailscale girişi başarısız. Auth key ve cihaz politikasını kontrol et."
           }
 
           Start-Sleep -Seconds 5
           $ip = (& $env:TAILSCALE_EXE ip -4 | Select-Object -First 1).Trim()
 
           if ([string]::IsNullOrWhiteSpace($ip)) {
-            throw "Tailscale IPv4 adresi alinamadi."
+            throw "Tailscale IPv4 adresi alınamadı."
           }
 
           "RDP_IP=$ip" | Out-File -FilePath $env:GITHUB_ENV -Append
-          Write-Host "Tailscale baglantisi hazir."
+          Write-Host "Tailscale bağlantısı hazır."
           Write-Host "RDP IP: $ip"
-          Write-Host "Kullanici adi: Draghyper"
+          Write-Host "Kullanıcı adı: Draghyper"
 
-      - name: Install Rclone and Mount TeraBox
+      - name: Install Rclone and Mount TeraBox as Z: Drive
         shell: pwsh
         env:
           CLOUD_COOKIE: ${{ secrets.CLOUD_COOKIE }}
         run: |
           $ErrorActionPreference = "Stop"
-          
+
+          Write-Host "Rclone indiriliyor..."
           curl.exe -sL `
             -o "$env:TEMP\rclone.zip" `
             "https://downloads.rclone.org/rclone-current-windows-amd64.zip"
-          
+
           Expand-Archive `
             -Path "$env:TEMP\rclone.zip" `
             -DestinationPath "$env:TEMP\rclone" -Force
-          
+
           $rcloneDir = Get-ChildItem `
             -Path "$env:TEMP\rclone" `
             -Filter "rclone-*-windows-amd64" | Select-Object -First 1
-          
+
           $rcloneExe = Join-Path $rcloneDir.FullName "rclone.exe"
           $env:PATH += ";$($rcloneDir.FullName)"
-          
+
+          Write-Host "TeraBox bağlanıyor..."
           $env:RCLONE_CONFIG_MYCLOUD_TYPE = "terabox"
           $env:RCLONE_CONFIG_MYCLOUD_NDUS = $env:CLOUD_COOKIE
-          
+
           Start-Process `
             -FilePath $rcloneExe `
             -ArgumentList "mount mycloud: Z: --vfs-cache-mode writes --volname 'TeraBox 1TB'" `
             -NoNewWindow -PassThru
-          
+
           Start-Sleep -Seconds 15
-          
+
           if (Test-Path "Z:\") {
-            Write-Host "TeraBox Z: surucusune baglandi."
-            
+            Write-Host "TeraBox Z: sürücüsüne bağlandı!"
+
+            Write-Host "İndirmeler Z: sürücüsüne yönlendiriliyor..."
             New-Item -ItemType Directory -Force -Path "Z:\Downloads" | Out-Null
             New-Item -ItemType Directory -Force -Path "Z:\Temp" | Out-Null
-            
+
             $dl = "C:\Users\Draghyper\Downloads"
             if (Test-Path $dl) {
               Remove-Item $dl -Recurse -Force -ErrorAction SilentlyContinue
             }
             cmd /c mklink /J $dl "Z:\Downloads"
-            
+
             $tmp = $env:TEMP
             if (Test-Path $tmp) {
               Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
             }
             cmd /c mklink /J $tmp "Z:\Temp"
-            
-            Write-Host "Indirmeler Z: surucusune yonlendirildi."
+
+            Write-Host "Yönlendirme tamamlandı. C: diski dolmayacak."
           } else {
-            Write-Host "UYARI: Z: surucusu baglanamadi. CLOUD_COOKIE degerini kontrol et."
+            Write-Host "UYARI: Z: sürücüsü bağlanamadı. CLOUD_COOKIE (ndus) değerini kontrol et."
           }
 
       - name: Verify RDP and Audio Policies
@@ -259,8 +279,8 @@ jobs:
           $policy = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
           $audio = Get-ItemProperty -Path $policy
 
-          Write-Host "Mikrofon yonlendirmesi engellenmiyor: $($audio.fDisableAudioCapture -eq 0)"
-          Write-Host "Ses cikisi yonlendirmesi engellenmiyor: $($audio.fDisableAudioPlayback -eq 0)"
+          Write-Host "Mikrofon yönlendirmesi engellenmiyor: $($audio.fDisableAudioCapture -eq 0)"
+          Write-Host "Ses çıkışı yönlendirmesi engellenmiyor: $($audio.fDisableAudioPlayback -eq 0)"
 
           Get-NetTCPConnection -LocalPort 3389 -State Listen `
             -ErrorAction SilentlyContinue |
@@ -272,12 +292,13 @@ jobs:
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
-          Write-Host "RDP oturumu 6 saate kadar acik tutulacak."
+          Write-Host "RDP oturumu 6 saate kadar açık tutulacak."
           Write-Host "Adres: $env:RDP_IP"
-          Write-Host "Kullanici adi: Draghyper"
-          Write-Host "Parola, GitHub RDP_PASSWORD secret degeridir."
+          Write-Host "Kullanıcı adı: Draghyper"
+          Write-Host "Parola, GitHub RDP_PASSWORD secret değeridir."
+          Write-Host "Parola güvenlik nedeniyle günlükte gösterilmiyor."
 
           for ($i = 1; $i -le 360; $i++) {
-            Write-Host "Baglanti aktif. Gecen sure: $i dakika"
+            Write-Host "Bağlantı aktif. Geçen süre: $i dakika"
             Start-Sleep -Seconds 60
           }
