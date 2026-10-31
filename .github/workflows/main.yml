@@ -1,80 +1,123 @@
-name: Optimized Remote Windows Environment
+name: RDP
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 */5 * * *' # Her 5 saatte bir otomatik yenilenir
+
+permissions:
+  contents: read
 
 jobs:
-  build:
+  secure-rdp:
     runs-on: windows-latest
     timeout-minutes: 360
-
     steps:
-    - name: Checkout Repository
-      uses: actions/checkout@v4
+      - name: 1. Validate Secrets
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          CLOUD_COOKIE: ${{ secrets.CLOUD_COOKIE }}
+        run: |
+          $hatalar = @()
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) { $hatalar += "RDP_PASSWORD eksik." }
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) { $hatalar += "TAILSCALE_AUTH_KEY eksik." }
+          elseif ($env:TAILSCALE_AUTH_KEY -notmatch '^tskey-auth-') { $hatalar += "TAILSCALE_AUTH_KEY yanlis format." }
+          if ([string]::IsNullOrWhiteSpace($env:CLOUD_COOKIE)) { $hatalar += "CLOUD_COOKIE eksik." }
+          if ($hatalar.Count -gt 0) { $hatalar | ForEach-Object { Write-Host $_ -ForegroundColor Red }; throw "Secret eksik!" }
+          Write-Host "Secret kontrolleri tamamlandi." -ForegroundColor Green
 
-    - name: Clean Up Disk Space (Maximize Free Space)
-      run: |
-        Write-Host "Cleaning up unnecessary files to free up disk space..."
-        # Gereksiz büyük dizinleri temizleyerek yer açıyoruz
-        Remove-Item -Recurse -Force "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\MSBuild" -ErrorAction SilentlyContinue
-        Remove-Item -Recurse -Force "C:\Android" -ErrorAction SilentlyContinue
-        Remove-Item -Recurse -Force "C:\vcpkg" -ErrorAction SilentlyContinue
-        
-        $freeSpace = [math]::Round((Get-PSDrive C).Free / 1GB, 2)
-        Write-Host "Current Free Space on C: $freeSpace GB"
+      - name: 2. Configure RDP and User
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $securePassword = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
+          $user = Get-LocalUser -Name "Draghyper" -ErrorAction SilentlyContinue
+          if ($null -eq $user) { New-LocalUser -Name "Draghyper" -Password $securePassword -Description "RDP account" | Out-Null }
+          else { Set-LocalUser -Name "Draghyper" -Password $securePassword }
+          Add-LocalGroupMember -Group "Administrators" -Member "Draghyper" -ErrorAction SilentlyContinue
+          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
+          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name UserAuthentication -Value 1
+          Set-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name SecurityLayer -Value 2
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop" -ErrorAction SilentlyContinue
+          Set-Service -Name TermService -StartupType Automatic
+          Restart-Service -Name TermService -Force
+          Write-Host "RDP ayarlari tamamlandi."
 
-    - name: Configure Windows Environment & RDP
-      run: |
-        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
-        Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1
-        
-        # Ses ve Mikrofon Yönlendirme İzinleri
-        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "fDisableAudioPlayback" -Value 0
-        Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "fDisableAudioCapture" -Value 0
-        
-        # Windows Audio Servisini Başlat
-        Set-Service -Name "Audiosrv" -StartupType Automatic
-        Start-Service -Name "Audiosrv"
+      - name: 3. Enable Audio and Microphone
+        shell: pwsh
+        run: |
+          $policyPath = "HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services"
+          New-Item -Path $policyPath -Force | Out-Null
+          New-ItemProperty -Path $policyPath -Name fDisableAudioCapture -PropertyType DWord -Value 0 -Force | Out-Null
+          New-ItemProperty -Path $policyPath -Name fDisableAudioPlayback -PropertyType DWord -Value 0 -Force | Out-Null
+          foreach ($svc in @("AudioEndpointBuilder", "Audiosrv")) {
+            $s = Get-Service -Name $svc -ErrorAction SilentlyContinue
+            if ($null -ne $s) { try { Set-Service -Name $svc -StartupType Automatic; Start-Service -Name $svc } catch {} }
+          }
+          Restart-Service -Name TermService -Force
+          Write-Host "Ses ve mikrofon ayarlari yapildi."
 
-    - name: Create Custom Administrator User ('Draghyper')
-      env:
-        RDP_PASS: ${{ secrets.RDP_PASSWORD }}
-      run: |
-        $username = "Draghyper"
-        $password = ConvertTo-SecureString $env:RDP_PASS -AsPlainText -Force
-        New-LocalUser -Name $username -Password $password -FullName "Draghyper Admin" -Description "Remote Gaming & Control User"
-        Add-LocalGroupMember -Group "Administrators" -Member $username
+      - name: 4. Free Disk Space
+        shell: pwsh
+        run: |
+          $tempPaths = @($env:TEMP, "$env:WINDIR\Temp")
+          foreach ($path in $tempPaths) {
+            if (Test-Path $path) { Get-ChildItem -LiteralPath $path -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue }
+          }
+          Write-Host "Gecici dosyalar temizlendi."
 
-    - name: Connect to Tailscale VPN
-      uses: tailscale/github-action@v2
-      with:
-        authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
-        version: latest
+      - name: 5. Install Tailscale
+        shell: pwsh
+        run: |
+          $msi = Join-Path $env:TEMP "tailscale-setup.msi"
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" -OutFile $msi
+          Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait
+          "TAILSCALE_EXE=$env:ProgramFiles\Tailscale\tailscale.exe" | Out-File -FilePath $env:GITHUB_ENV -Append
 
-    - name: Voice Notification & System Ready Check
-      run: |
-        Add-Type -AssemblyName System.Speech
-        $speak = New-Object System.Speech.Synthesis.SpeechSynthesizer
-        $speak.Speak("Remote Windows environment is ready.")
+      - name: 6. Connect Tailscale
+        shell: pwsh
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $hostname = "gh-runner-$env:GITHUB_RUN_ID"
+          & $env:TAILSCALE_EXE up --auth-key="$env:TAILSCALE_AUTH_KEY" --hostname="$hostname"
+          Start-Sleep -Seconds 5
+          $ip = (& $env:TAILSCALE_EXE ip -4 | Select-Object -First 1).Trim()
+          "RDP_IP=$ip" | Out-File -FilePath $env:GITHUB_ENV -Append
+          Write-Host "Tailscale baglandi. IP: $ip"
 
-    - name: Keep-Alive & Auto-Restart Loop (Bypass 6-Hour Limit)
-      run: |
-        Write-Host "Environment is running. Monitoring time..."
-        $duration = 345 # 345 dakika
-        for ($i = 1; $i -le $duration; $i++) {
-            Start-Sleep -Seconds 60
-        }
-        
-        $headers = @{
-            "Authorization" = "token ${{ secrets.GITHUB_TOKEN }}"
-            "Accept" = "application/vnd.github.v3+json"
-        }
-        $body = @{
-            ref = "${{ github.ref_name }}"
-        } | ConvertTo-Json
+      - name: 7. Mount TeraBox as Z: Drive
+        shell: pwsh
+        env:
+          CLOUD_COOKIE: ${{ secrets.CLOUD_COOKIE }}
+        run: |
+          curl.exe -sL -o "$env:TEMP\rclone.zip" "https://downloads.rclone.org/rclone-current-windows-amd64.zip"
+          Expand-Archive -Path "$env:TEMP\rclone.zip" -DestinationPath "$env:TEMP\rclone" -Force
+          $rcloneDir = Get-ChildItem -Path "$env:TEMP\rclone" -Filter "rclone-*-windows-amd64" | Select-Object -First 1
+          $rcloneExe = Join-Path $rcloneDir.FullName "rclone.exe"
+          $env:RCLONE_CONFIG_MYCLOUD_TYPE = "terabox"
+          $env:RCLONE_CONFIG_MYCLOUD_NDUS = $env:CLOUD_COOKIE
+          Start-Process -FilePath $rcloneExe -ArgumentList "mount mycloud: Z: --vfs-cache-mode writes --volname 'TeraBox 1TB'" -NoNewWindow -PassThru
+          Start-Sleep -Seconds 15
+          if (Test-Path "Z:\") {
+            Write-Host "TeraBox Z: surucusune baglandi!" -ForegroundColor Green
+            New-Item -ItemType Directory -Force -Path "Z:\Downloads", "Z:\Temp" | Out-Null
+            $dl = "C:\Users\Draghyper\Downloads"
+            if (Test-Path $dl) { Remove-Item $dl -Recurse -Force -ErrorAction SilentlyContinue }
+            cmd /c mklink /J $dl "Z:\Downloads"
+            $tmp = $env:TEMP
+            if (Test-Path $tmp) { Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue }
+            cmd /c mklink /J $tmp "Z:\Temp"
+            Write-Host "Indirmeler Z: diskine yonlendirildi." -ForegroundColor Green
+          } else {
+            Write-Host "UYARI: Z: surucusu baglanamadi. CLOUD_COOKIE degerini kontrol et." -ForegroundColor Red
+          }
 
-        Invoke-RestMethod -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/${{ github.workflow }}/dispatches" -Method Post -Headers $headers -Body $body
-        Write-Host "Auto-restart workflow triggered successfully!"
+      - name: 8. Maintain Connection
+        shell: pwsh
+        run: |
+          Write-Host "RDP oturumu 6 saate kadar acik tutulacak."
+          Write-Host "Adres: $env:RDP_IP"
+          Write-Host "Kullanici adi: Draghyper"
+          for ($i = 1; $i -le 360; $i++) { Start-Sleep -Seconds 60 }
