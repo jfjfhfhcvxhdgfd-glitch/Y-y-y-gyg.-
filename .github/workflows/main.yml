@@ -33,7 +33,7 @@ jobs:
             throw "TAILSCALE_AUTH_KEY secret eksik."
           }
           if ([string]::IsNullOrWhiteSpace($env:CLOUD_COOKIE)) {
-            throw "CLOUD_COOKIE secret eksik. (TeraBox ndus çerezi)"
+            throw "CLOUD_COOKIE secret eksik."
           }
           Write-Host "Gerekli secret kontrolleri tamamlandı."
 
@@ -84,6 +84,29 @@ jobs:
 
           Write-Host "Windows RDP ayarları tamamlandı."
 
+      - name: Free Temporary Disk Space
+        shell: pwsh
+        run: |
+          Write-Host "=== Disk space before cleanup ==="
+          Get-PSDrive C
+
+          $tempPaths = @(
+            $env:TEMP,
+            "$env:WINDIR\Temp"
+          )
+
+          foreach ($path in $tempPaths) {
+            if (Test-Path $path) {
+              Get-ChildItem -LiteralPath $path -Force `
+                -ErrorAction SilentlyContinue |
+              Remove-Item -Recurse -Force `
+                -ErrorAction SilentlyContinue
+            }
+          }
+
+          Write-Host "=== Disk space after cleanup ==="
+          Get-PSDrive C
+
       - name: Enable RDP Audio and Microphone Redirection
         shell: pwsh
         run: |
@@ -133,30 +156,6 @@ jobs:
           Restart-Service -Name TermService -Force
           Start-Sleep -Seconds 3
           Write-Host "RDP servisi ses yönlendirme ilkelerinden sonra yeniden başlatıldı."
-
-      - name: Free Temporary Disk Space
-        shell: pwsh
-        run: |
-          Write-Host "=== Disk space before cleanup ==="
-          Get-PSDrive C
-
-          $tempPaths = @(
-            $env:TEMP,
-            "$env:WINDIR\Temp"
-          )
-
-          foreach ($path in $tempPaths) {
-            if (Test-Path $path) {
-              Get-ChildItem -LiteralPath $path -Force `
-                -ErrorAction SilentlyContinue |
-              Remove-Item -Recurse -Force `
-                -ErrorAction SilentlyContinue
-            }
-          }
-
-          Write-Host "=== Disk space after cleanup ==="
-          Get-PSDrive C
-          Write-Host "Geçici dosyalar temizlendi."
 
       - name: Install Tailscale
         shell: pwsh
